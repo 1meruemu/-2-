@@ -1,0 +1,320 @@
+name: Lint
+
+on:
+  schedule:
+    - cron: '17 18 * * *' # 03:17 JST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: nightly-textlint
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    if: ${{ !github.event.repository.is_template || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      REPORT_TITLE: Nightly textlint report
+      REPORT_MARKER: '<!-- nightly-textlint-report:v1 -->'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Check for changed inputs
+        id: inputs
+        env:
+          FORCE: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          # Include paths as well as content in the fingerprint.
+          digest=$(git ls-tree -r -z HEAD | sha256sum | cut -d' ' -f1)
+          echo "hash=$digest" >> "$GITHUB_OUTPUT"
+          # Use the Issues API rather than the eventually consistent search index.
+          gh api --paginate --slurp \
+            "repos/$GH_REPO/issues?state=all&per_page=100" |
+            jq --arg title "$REPORT_TITLE" --arg marker "$REPORT_MARKER" \
+              '[.[][] | select(.pull_request == null and .user.login == "github-actions[bot]"
+                and .title == $title and ((.body // "") | contains($marker)))]' \
+              > "$RUNNER_TEMP/lint-issues.json"
+          count=$(jq 'length' "$RUNNER_TEMP/lint-issues.json")
+          if [[ "$count" -gt 1 ]]; then
+            echo "::error::Multiple nightly reports found"
+            exit 1
+          fi
+          if [[ "$FORCE" != true && "$count" == 1 ]] &&
+             jq -e --arg marker "<!-- input:$digest -->" \
+               '.[0].body | contains($marker)' "$RUNNER_TEMP/lint-issues.json" >/dev/null; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No input changes; skipping lint"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node
+        if: steps.inputs.outputs.run == 'true'
+        uses: actions/setup-node@v7
+        with:
+          cache: npm
+          node-version: '24.x'
+
+      - name: Install dependencies
+        if: steps.inputs.outputs.run == 'true'
+        run: npm ci
+
+      - name: Resolve referenced TeX files
+        if: steps.inputs.outputs.run == 'true'
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { execFileSync } = require('node:child_process');
+          const root = process.cwd();
+          const tracked = execFileSync('git', ['ls-files', '-z'], {encoding: 'utf8'})
+            .split('\0').filter(p => p.endsWith('.tex'));
+          const known = new Set(tracked);
+          const seen = new Set();
+          const uncertain = new Set();
+          function visit(file) {
+            if (seen.has(file)) return;
+            seen.add(file);
+            const source = fs.readFileSync(file, 'utf8')
+              .replace(/\\(?:verb\*?)([^a-zA-Z\s])[^ \r\n]*?\1/g, '')
+              .replace(/\\begin\{(verbatim\*?|Verbatim|lstlisting|minted)\}[\s\S]*?\\end\{\1\}/g, '')
+              .replace(/(^|[^\\])(?:\\\\)*%[^\r\n]*/gm, '$1');
+            const body = source.split(/\\end\{document\}|\\endinput\b/)[0];
+            for (const match of body.matchAll(/\\(?:input|include|subfile)\b\s*(?:\{([^{}]+)\}|([^\s{}%\\]+))/g)) {
+              let name = (match[1] ?? match[2]).trim();
+              if (/[\\#$]/.test(name)) { uncertain.add(file + ': ' + name); continue; }
+              if (!name.endsWith('.tex')) name += '.tex';
+              const choices = [...new Set([path.normalize(name), path.normalize(path.join(path.dirname(file), name))])]
+                .filter(p => known.has(p));
+              if (choices.length === 0) { uncertain.add(file + ': ' + name); continue; }
+              if (choices.length > 1) uncertain.add(file + ': ' + name + ' (ambiguous)');
+              for (const candidate of choices) visit(candidate);
+            }
+            if (/\\(?:import|subimport|inputfrom|includefrom|subfileinclude|includeonly)\b/.test(body))
+              uncertain.add(file + ': unsupported include command');
+            if (/\\(?:input|include|subfile)\b\s*(?:\\|(?:\{[^}]*[\\#]))/.test(body))
+              uncertain.add(file + ': dynamic include');
+          }
+          visit('main.tex');
+          // When static resolution is uncertain, avoid declaring files unused.
+          const candidates = tracked.filter(p => p.startsWith('sections/'));
+          const unused = uncertain.size ? [] : candidates.filter(p => !seen.has(p)).sort();
+          const targets = [...new Set([...seen, ...(uncertain.size ? candidates : [])])].sort();
+          fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'tex-targets.json'), JSON.stringify(targets));
+          fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'tex-unused.json'), JSON.stringify(unused));
+          fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'tex-uncertain.json'), JSON.stringify([...uncertain].sort()));
+          console.log('Lint targets:', targets);
+          console.log('Unused files:', unused);
+          if (uncertain.size) console.warn('Static resolution incomplete:', [...uncertain]);
+          NODE
+
+      - name: Run textlint
+        if: steps.inputs.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          status=0
+          mapfile -d '' -t targets < <(jq -j '.[] | . + "\u0000"' "$RUNNER_TEMP/tex-targets.json")
+          npm run --silent lint -- --format json -- "${targets[@]}" \
+            > "$RUNNER_TEMP/textlint.json" || status=$?
+          if [[ "$status" -gt 1 ]] || ! jq -e '
+            type == "array" and length > 0 and
+            all(.[]; (.filePath | type == "string") and
+              (.messages | type == "array") and
+              all(.messages[]; (.message | type == "string") and
+                (.fatal != true) and (.ruleId | type == "string") and
+                (.line | type == "number") and (.column | type == "number")))
+            ' "$RUNNER_TEMP/textlint.json" >/dev/null; then
+            echo "::error::Invalid textlint output or execution failure"
+            exit 1
+          fi
+          count=$(jq '[.[].messages[]] | length' "$RUNNER_TEMP/textlint.json")
+          if [[ "$status" == 1 && "$count" == 0 ]]; then
+            echo "::error::textlint failed without diagnostics"
+            exit 1
+          fi
+          echo "Found $count diagnostics"
+
+      - name: Check LaTeX citations and references
+        if: steps.inputs.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          # Reuse the project's existing Docker-backed make check.
+          status=0
+          make check FILE=main USE_DOCKER=yes > "$RUNNER_TEMP/reference-check.log" 2>&1 || status=$?
+          if [[ "$status" == 0 && -f build-check/reference-check.status ]] &&
+             [[ "$(cat build-check/reference-check.status)" == clean ]]; then
+            result=clean
+          elif [[ -f build-check/reference-check.status ]] &&
+               [[ "$(cat build-check/reference-check.status)" == findings ]]; then
+            result=findings
+          else
+            result=failed
+          fi
+          printf '%s\n' "$result" > "$RUNNER_TEMP/reference-status.txt"
+          # Only print the controlled status; the untrusted compiler output is an artifact.
+          echo "Reference check: $result"
+
+      - name: Publish report
+        if: steps.inputs.outputs.run == 'true'
+        env:
+          INPUT_HASH: ${{ steps.inputs.outputs.hash }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          reference_status=$(cat "$RUNNER_TEMP/reference-status.txt")
+          # A failed check must be retried on the next schedule, even without edits.
+          if [[ "$reference_status" == failed ]]; then INPUT_HASH=failed; fi
+          reference_text="$RUNNER_TEMP/reference-report.txt"
+          if [[ "$reference_status" == findings && -f build-check/reference-check.txt ]]; then
+            cp build-check/reference-check.txt "$reference_text"
+          else
+            : > "$reference_text"
+          fi
+          # Parse checkcites v2.8 summaries and keys, never its banner/progress output.
+          # Unknown formats remain visible as an incomplete check, not a false zero.
+          jq -Rn '
+            reduce inputs as $line
+              ({unused:null,undefined:null,unused_keys:[],undefined_keys:[],warnings:[],section:null};
+               if ($line | test("^\\s*Unused references in your TeX document: [0-9]+\\s*$")) then
+                 .unused = ($line | capture(": (?<n>[0-9]+)\\s*$").n | tonumber) | .section="unused"
+               elif ($line | test("^\\s*Undefined references in your TeX document: [0-9]+\\s*$")) then
+                 .undefined = ($line | capture(": (?<n>[0-9]+)\\s*$").n | tonumber) | .section="undefined"
+               elif ($line | test("^\\s*=>\\s*")) and .section != null then
+                 ($line | sub("^\\s*=>\\s*";"") | sub("\\s+$";"")) as $key |
+                 if .section == "unused" then .unused_keys += [$key]
+                 else .undefined_keys += [$key] end
+               elif ($line | test("^(Package refcheck Warning|LaTeX Warning:|Package biblatex Warning:)")) then
+                 .warnings += [$line] | .section=null
+               else . end)
+            | del(.section) | .warnings |= unique
+          ' < "$reference_text" > "$RUNNER_TEMP/reference-summary.json"
+          if [[ "$reference_status" == clean ]]; then
+            jq -n '{unused:0,undefined:0,unused_keys:[],undefined_keys:[],warnings:[]}' > "$RUNNER_TEMP/reference-summary.json"
+          elif [[ "$reference_status" == findings ]] && ! jq -e '
+            .unused != null and .undefined != null and
+            .unused == (.unused_keys|length) and .undefined == (.undefined_keys|length) and
+            (.unused + .undefined + (.warnings|length) > 0)
+          ' "$RUNNER_TEMP/reference-summary.json" >/dev/null; then
+            reference_status=incomplete
+            INPUT_HASH=failed
+            printf '%s\n' incomplete > "$RUNNER_TEMP/reference-status.txt"
+          fi
+          jq -r --arg reference_status "$reference_status" --slurpfile ref "$RUNNER_TEMP/reference-summary.json" \
+            --arg root "$GITHUB_WORKSPACE/" --arg repo "$GH_REPO" \
+            --arg branch "$DEFAULT_BRANCH" --arg hash "$INPUT_HASH" --arg marker "$REPORT_MARKER" \
+            --slurpfile unused "$RUNNER_TEMP/tex-unused.json" \
+            --slurpfile uncertain "$RUNNER_TEMP/tex-uncertain.json" '
+            def esc: gsub("[\r\n]"; " ") | gsub("&"; "&amp;") |
+              gsub("<"; "&lt;") | gsub(">"; "&gt;") | gsub("@"; "&#64;") |
+              gsub("\\["; "&#91;") | gsub("\\]"; "&#93;") |
+              gsub("\\*"; "&#42;") | gsub("\u0060"; "&#96;") |
+              gsub("\\|"; "&#124;") | gsub("\\\\"; "&#92;");
+            def urlpath: split("/") | map(@uri) | join("/");
+            def n: if . == null then "未確認" else tostring end;
+            def keys_report($title; $count; $keys; $advice):
+              "### " + $title + "（" + ($count | n) + "件）\n\n" +
+              (if $count == null then "判定できませんでした。"
+               elif $count == 0 then "指摘事項はありません。"
+               else $advice + "\n\n" + ($keys | map("- " + (. | esc)) | join("\n")) end);
+            $ref[0] as $r |
+            [ .[] | (.filePath | ltrimstr($root) | ltrimstr("./")) as $path |
+              .messages[] | {path: $path, line, column, message, ruleId, severity} ] |
+            sort_by(.path,.line,.column,.ruleId,.message) as $items |
+            ($items | map(
+              "| [" + (.path | esc) + ":" + (.line | tostring) + ":" +
+              (.column | tostring) + "](https://github.com/" + $repo + "/blob/" +
+              ($branch | @uri) + "/" + (.path | urlpath) + "#L" + (.line | tostring) +
+              ") | " + (.message | esc) + " | " + (.ruleId | esc) + " |"
+            )) as $lines |
+            ($marker + "\n<!-- input:" + $hash + " -->\n\n## 検査結果\n\n" +
+             "| 検査項目 | 指摘件数 |\n|---|---:|\n" +
+             "| 未使用TeXファイル | " + (if ($uncertain[0]|length)>0 then "判定保留" else ($unused[0]|length|tostring) end) + " |\n" +
+             "| 未引用の参考文献 | " + ($r.unused|n) + " |\n" +
+             "| 未定義の文献引用 | " + ($r.undefined|n) + " |\n" +
+             "| LaTeX参照警告 | " + (if $reference_status == "failed" or $reference_status == "incomplete" then "判定保留" else ($r.warnings|length|tostring) end) + " |\n" +
+             "| 文章校正 | " + ($items|length|tostring) + " |\n\n## 未使用のTeXファイル\n\n" +
+             (if ($uncertain[0] | length) > 0 then "参照の静的解析が不完全なため、未使用判定を保留します。参照を確認してください。\n\n" + ($uncertain[0] | map("- " + (. | esc)) | join("\n"))
+              elif ($unused[0] | length) == 0 then "未使用ファイルはありません。"
+              else "以下のファイルは main.tex から参照されていません。不要なテンプレート・原稿ファイルは削除してください。\n\n" + ($unused[0] | map("- [" + (. | esc) + "](https://github.com/" + $repo + "/blob/" + ($branch | @uri) + "/" + (. | urlpath) + ")") | join("\n")) end) +
+             "\n\n## 引用・参照チェック\n\n" +
+             (if $reference_status == "failed" or $reference_status == "incomplete" then
+                "検査の実行または結果の解析に失敗しました。Actionsのreference-check Artifactを確認してください。次回も検査します。"
+              else
+                keys_report("未引用の参考文献"; $r.unused; $r.unused_keys; "不要な参考文献は文献データベースから削除してください。") +
+                "\n\n" + keys_report("未定義の文献引用"; $r.undefined; $r.undefined_keys; "引用キーと参考文献データベースを確認してください。") +
+                "\n\n### 図表・数式等の参照警告（" + ($r.warnings|length|tostring) + "件）\n\n" +
+                (if ($r.warnings|length)==0 then "指摘事項はありません。"
+                 else ($r.warnings|map("- " + esc)|join("\n")) end)
+              end) +
+             "\n\n## 文章校正結果\n\n検出件数: " +
+             ($items | length | tostring) + "\n\n") +
+            (if ($items | length) == 0 then "指摘事項はありません。"
+             else "| 場所 | 指摘内容 | ルール |\n|---|---|---|\n" + ($lines | join("\n")) end) |
+            if length > 60000 then .[0:58000] +
+              "\n\n（表示上限により省略。詳細はActionsのtextlint-result artifactを参照。）"
+            else . end
+          ' "$RUNNER_TEMP/textlint.json" > "$RUNNER_TEMP/lint-body.md"
+
+          count=$(jq '[.[].messages[]] | length' "$RUNNER_TEMP/textlint.json")
+          state=open
+          unused_count=$(jq length "$RUNNER_TEMP/tex-unused.json")
+          uncertain_count=$(jq length "$RUNNER_TEMP/tex-uncertain.json")
+          if [[ "$count" == 0 && "$unused_count" == 0 && "$uncertain_count" == 0 && "$reference_status" == clean ]]; then state=closed; fi
+          number=$(jq -r '.[0].number // empty' "$RUNNER_TEMP/lint-issues.json")
+          if [[ -n "$number" ]]; then
+            if jq -e --rawfile body "$RUNNER_TEMP/lint-body.md" --arg state "$state" \
+              '.[0] | .body == ($body | rtrimstr("\n")) and .state == $state' \
+              "$RUNNER_TEMP/lint-issues.json" >/dev/null; then
+              echo "Report unchanged"
+              exit 0
+            fi
+            jq -n --rawfile body "$RUNNER_TEMP/lint-body.md" --arg state "$state" \
+              '{body: ($body | rtrimstr("\n")), state: $state}' |
+              gh api --method PATCH "repos/$GH_REPO/issues/$number" --input - --jq .html_url
+          else
+            number=$(jq -n --rawfile body "$RUNNER_TEMP/lint-body.md" --arg title "$REPORT_TITLE" \
+              '{title: $title, body: ($body | rtrimstr("\n"))}' |
+              gh api --method POST "repos/$GH_REPO/issues" --input - --jq .number)
+            if [[ "$state" == closed ]]; then
+              gh issue close "$number"
+            fi
+          fi
+
+      - name: Upload lint result
+        if: always() && steps.inputs.outputs.run == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: textlint-result
+          path: ${{ runner.temp }}/textlint.json
+          if-no-files-found: ignore
+
+      - name: Upload reference check result
+        if: always() && steps.inputs.outputs.run == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: reference-check
+          path: |
+            ${{ runner.temp }}/reference-check.log
+            build-check/reference-check.txt
+            build-check/main.log
+          if-no-files-found: ignore
+
+      - name: Fail on reference check execution errors
+        if: steps.inputs.outputs.run == 'true'
+        run: |
+          if [[ "$(cat "$RUNNER_TEMP/reference-status.txt")" =~ ^(failed|incomplete)$ ]]; then
+            echo "::error::LaTeX compilation or reference check failed; see report and artifact"
+            exit 1
+          fi
